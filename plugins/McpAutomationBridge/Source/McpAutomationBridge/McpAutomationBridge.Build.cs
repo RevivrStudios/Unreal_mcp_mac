@@ -3,11 +3,16 @@ using System;
 using System.IO;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
+// macOS/Linux compatibility: kernel32.dll P/Invoke is isolated in a nested class (see WindowsMemoryApi below)
 
 public class McpAutomationBridge : ModuleRules
 {
     // ============================================================================
     // NATIVE WINDOWS API FOR ACTUAL MEMORY DETECTION
+    // macOS/Linux: The kernel32.dll P/Invoke is declared inside a nested static
+    // class that is only accessed at runtime when running on Windows. This prevents
+    // Mono/dotnet from throwing DllNotFoundException on macOS and Linux when UBT
+    // loads this Build.cs module rule.
     // ============================================================================
     [StructLayout(LayoutKind.Sequential)]
     private struct MEMORYSTATUSEX
@@ -23,9 +28,14 @@ public class McpAutomationBridge : ModuleRules
         internal ulong ullAvailExtendedVirtual;
     }
 
-    [DllImport("kernel32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX lpBuffer);
+    // Nested class isolates the DllImport so the JIT only resolves kernel32.dll
+    // when this class is actually used (i.e., only on Windows at runtime).
+    private static class WindowsMemoryApi
+    {
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX lpBuffer);
+    }
 
     /// <summary>
     /// Configures build rules, dependencies, and compile-time feature definitions for the McpAutomationBridge module based on the provided build target.
@@ -339,13 +349,14 @@ PublicDependencyModuleNames.AddRange(new string[]
     {
         try
         {
-            // Try Windows API first (most accurate)
+            // Try Windows API first (most accurate).
+            // WindowsMemoryApi is a nested class so kernel32.dll is only JIT-resolved on Windows.
             if (Environment.OSVersion.Platform == PlatformID.Win32NT)
             {
                 var memStatus = new MEMORYSTATUSEX();
                 memStatus.dwLength = (uint)Marshal.SizeOf(typeof(MEMORYSTATUSEX));
                 
-                if (GlobalMemoryStatusEx(ref memStatus))
+                if (WindowsMemoryApi.GlobalMemoryStatusEx(ref memStatus))
                 {
                     // Return available physical memory in MB
                     return (long)(memStatus.ullAvailPhys / (1024 * 1024));
@@ -357,7 +368,7 @@ PublicDependencyModuleNames.AddRange(new string[]
             // Fall through to heuristics
         }
         
-        // Fallback: Check for environment variable hint
+        // Fallback: Check for environment variable hint (works on all platforms)
         string MemoryHint = Environment.GetEnvironmentVariable("UE_BUILD_MEMORY_MB");
         if (!string.IsNullOrEmpty(MemoryHint))
         {
@@ -368,8 +379,8 @@ PublicDependencyModuleNames.AddRange(new string[]
             }
         }
         
-        // Conservative fallback - assume 4GB available
-        return 4096;
+        // macOS/Linux fallback: return a safe default (8 GB)
+        return 8192;
     }
 
     /// <summary>
@@ -380,12 +391,13 @@ PublicDependencyModuleNames.AddRange(new string[]
     {
         try
         {
+            // WindowsMemoryApi nested class ensures kernel32.dll is only resolved on Windows.
             if (Environment.OSVersion.Platform == PlatformID.Win32NT)
             {
                 var memStatus = new MEMORYSTATUSEX();
                 memStatus.dwLength = (uint)Marshal.SizeOf(typeof(MEMORYSTATUSEX));
                 
-                if (GlobalMemoryStatusEx(ref memStatus))
+                if (WindowsMemoryApi.GlobalMemoryStatusEx(ref memStatus))
                 {
                     return (long)(memStatus.ullTotalPhys / (1024 * 1024));
                 }
@@ -393,7 +405,7 @@ PublicDependencyModuleNames.AddRange(new string[]
         }
         catch { }
         
-        return 8192; // Conservative fallback
+        return 8192; // Safe default for macOS/Linux and Windows fallback
     }
 
     /// <summary>
